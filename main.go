@@ -2,10 +2,12 @@ package main
 
 import (
 	"database/sql"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -23,11 +25,11 @@ type Curso struct {
 	Costo    string
 }
 
-const (
-	telegramBotToken = "8052743293:AAGQTDeTPKBNtRklb1aVEFT_QYDJKBT_g8g"
-	telegramChatID   = "-1002433576509"
-	telegramThreadID = "875"
-	dbFile           = "cursos.db"
+var (
+	telegramBotToken string
+	telegramChatID   string
+	telegramThreadID string
+	dbFile           string
 )
 
 func initDB() *sql.DB {
@@ -35,6 +37,7 @@ func initDB() *sql.DB {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	query := `CREATE TABLE IF NOT EXISTS cursos (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		url TEXT UNIQUE,
@@ -45,8 +48,8 @@ func initDB() *sql.DB {
 		plazas TEXT,
 		costo TEXT
 	)`
-	_, err = db.Exec(query)
-	if err != nil {
+
+	if _, err = db.Exec(query); err != nil {
 		log.Fatal(err)
 	}
 	return db
@@ -62,13 +65,14 @@ func cursoExiste(db *sql.DB, url string) bool {
 }
 
 func guardarCurso(db *sql.DB, curso Curso) {
-	_, err := db.Exec("INSERT INTO cursos (url, titulo, lugar, periodo, hora, plazas, costo) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		curso.URL, curso.Titulo, curso.Lugar, curso.Periodo, curso.Hora, curso.Plazas, curso.Costo)
+	_, err := db.Exec(
+		"INSERT INTO cursos (url, titulo, lugar, periodo, hora, plazas, costo) VALUES (?, ?, ?, ?, ?, ?, ?)",
+		curso.URL, curso.Titulo, curso.Lugar, curso.Periodo, curso.Hora, curso.Plazas, curso.Costo,
+	)
 	if err != nil {
 		log.Println("Error guardando en la base de datos:", err)
 	}
 }
-
 
 func sendTelegramMessage(message string) {
 	telegramAPI := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramBotToken)
@@ -76,7 +80,12 @@ func sendTelegramMessage(message string) {
 	params.Set("chat_id", telegramChatID)
 	params.Set("text", message)
 	params.Set("parse_mode", "Markdown")
-	params.Set("message_thread_id", telegramThreadID)
+
+	if telegramThreadID != "" {
+		fmt.Println("threadId:", telegramThreadID)
+
+		params.Set("message_thread_id", telegramThreadID)
+	}
 
 	_, err := http.PostForm(telegramAPI, params)
 	if err != nil {
@@ -84,10 +93,44 @@ func sendTelegramMessage(message string) {
 	}
 }
 
-
 func main() {
+	// Configuración de parámetros
+	flag.StringVar(&dbFile, "db", "", "Ruta de la base de datos (env: DB_FILE)")
+	flag.StringVar(&telegramBotToken, "token", "", "Token del bot de Telegram (env: TELEGRAM_TOKEN)")
+	flag.StringVar(&telegramChatID, "chatid", "", "ID del chat de Telegram (env: TELEGRAM_CHATID)")
+	flag.StringVar(&telegramThreadID, "threadid", "", "ID del hilo en Telegram (env: TELEGRAM_THREADID)")
+	flag.Parse()
+
+	// Obtener valores de entorno si no se establecieron por flags
+	if dbFile == "" {
+		dbFile = os.Getenv("DB_FILE")
+		if dbFile == "" {
+			dbFile = "cursos.db" // Valor por defecto original
+		}
+	}
+	if telegramBotToken == "" {
+		telegramBotToken = os.Getenv("TELEGRAM_TOKEN")
+	}
+	if telegramChatID == "" {
+		telegramChatID = os.Getenv("TELEGRAM_CHATID")
+	}
+	if telegramThreadID == "" {
+		telegramThreadID = os.Getenv("TELEGRAM_THREADID")
+	}
+
+	// Validar parámetros obligatorios
+	if telegramBotToken == "" {
+		log.Fatal("Se requiere el token de Telegram. Usa el flag -token o la variable TELEGRAM_TOKEN")
+	}
+	if telegramChatID == "" {
+		log.Fatal("Se requiere el ID del chat. Usa el flag -chatid o la variable TELEGRAM_CHATID")
+	}
+
+	// Inicializar base de datos
 	db := initDB()
 	defer db.Close()
+
+	// Configurar collector
 	c := colly.NewCollector(
 		colly.AllowedDomains("formacionagraria.tenerife.es"),
 		colly.Async(true),
@@ -105,10 +148,10 @@ func main() {
 	c.OnHTML("a[href^='/acfor-fo/actividades/']", func(e *colly.HTMLElement) {
 		link := e.Attr("href")
 		if strings.Contains(link, "solicitud") {
-                    return
-                }
+			return
+		}
 		if !strings.HasPrefix(link, "http") {
-                    link = e.Request.AbsoluteURL(link)
+			link = e.Request.AbsoluteURL(link)
 		}
 		e.Request.Visit(link)
 	})
@@ -117,12 +160,12 @@ func main() {
 	c.OnHTML("div.container.page-body", func(e *colly.HTMLElement) {
 		titulo := e.ChildText("span.convocatoria-titulo")
 		if titulo == "" {
-		    return
-	        }
+			return
+		}
 
 		curso := Curso{
 			URL:    e.Request.URL.String(),
-			Titulo: e.ChildText("span.convocatoria-titulo"),
+			Titulo: titulo,
 		}
 
 		// Buscar todos los campos en las filas
@@ -143,10 +186,11 @@ func main() {
 				curso.Costo = value
 			}
 		})
-                if !cursoExiste(db, curso.URL) {
-		    cursos = append(cursos, curso)
-		    guardarCurso(db, curso)
-	    }
+
+		if !cursoExiste(db, curso.URL) {
+			cursos = append(cursos, curso)
+			guardarCurso(db, curso)
+		}
 	})
 
 	c.OnRequest(func(r *colly.Request) {
@@ -157,37 +201,25 @@ func main() {
 		log.Println("Error:", err)
 	})
 
-	err := c.Visit("https://formacionagraria.tenerife.es/")
-	if err != nil {
+	if err := c.Visit("https://formacionagraria.tenerife.es/"); err != nil {
 		log.Fatal(err)
 	}
 
 	c.Wait()
 
-	fmt.Println("\nCursos encontrados:", len(cursos))
+	// Construir y enviar mensaje
 	var messageBuilder strings.Builder
 	if len(cursos) > 0 {
-            messageBuilder.WriteString(fmt.Sprintf("Hay cursos nuevos!\n"))
-        }
-	for i, curso := range cursos {
-		fmt.Printf("\nCurso #%d:\n", i+1)
-		fmt.Println("URL:", curso.URL)
-		fmt.Println("Título:", curso.Titulo)
-		fmt.Println("Lugar:", curso.Lugar)
-		fmt.Println("Período:", curso.Periodo)
-		fmt.Println("Horario:", curso.Hora)
-		fmt.Println("Plazas:", curso.Plazas)
-		fmt.Println("Costo:", curso.Costo)
-		fmt.Println("-----------------------------------")
-		messageBuilder.WriteString(fmt.Sprintf("\n*Curso %d:*\n", i+1))
-		messageBuilder.WriteString(fmt.Sprintf("Título: %s\n", curso.Titulo))
-		messageBuilder.WriteString(fmt.Sprintf("Lugar: %s\n", curso.Lugar))
-		messageBuilder.WriteString(fmt.Sprintf("Período: %s\n", curso.Periodo))
-		messageBuilder.WriteString(fmt.Sprintf("Horario: %s\n", curso.Hora))
-		messageBuilder.WriteString(fmt.Sprintf("Plazas: %s\n", curso.Plazas))
-		messageBuilder.WriteString(fmt.Sprintf("Costo: %s\n", curso.Costo))
-		messageBuilder.WriteString(fmt.Sprintf("[Ver más](%s)\n", curso.URL))
-		messageBuilder.WriteString("-----------------------------------\n")
+		messageBuilder.WriteString("¡Hay cursos nuevos!\n\n")
+		for i, curso := range cursos {
+			fmt.Println("Preprando mensaje para curso:", curso.Titulo)
+			messageBuilder.WriteString(
+				fmt.Sprintf("*Curso %d:*\nTítulo: %s\nLugar: %s\nPeríodo: %s\nHorario: %s\nPlazas: %s\nCosto: %s\n[Ver más](%s)\n\n",
+					i+1, curso.Titulo, curso.Lugar, curso.Periodo, curso.Hora, curso.Plazas, curso.Costo, curso.URL),
+			)
+		}
+		sendTelegramMessage(messageBuilder.String())
+		fmt.Println("mensaje enviado a:", telegramChatID)
+
 	}
-	sendTelegramMessage(messageBuilder.String())
 }
